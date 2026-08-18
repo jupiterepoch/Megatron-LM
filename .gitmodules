@@ -1,0 +1,4 @@
+[submodule "megatron/core/extensions/mixture_of_kittens"]
+	path = megatron/core/extensions/mixture_of_kittens
+	url = https://github.com/jupiterepoch/mixture-of-kittens.git
+	branch = megatron-integration

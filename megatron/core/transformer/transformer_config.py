@@ -701,6 +701,33 @@ class TransformerConfig(ModelParallelConfig):
     moe-shared-expert-intermediate-size is set."""
 
     moe_shared_expert_overlap: bool = False
+
+    moe_megakernel_backend: Optional[str] = None
+    """Opt-in fused MoE megakernel backend for the routed experts. Only 'mok'
+    (mixture-of-kittens) is supported. The shared expert, including a learned shared-expert
+    gate, keeps running in the ordinary PyTorch graph. Never falls back silently: an
+    incompatible configuration raises."""
+
+    moe_megakernel_fwd_num_comm_sms: int = 40
+    """Communication SMs used by the MoK forward megakernel."""
+
+    moe_megakernel_bwd_num_comm_sms: int = 28
+    """Communication SMs used by the MoK backward megakernel."""
+
+    moe_megakernel_minibatch_size: int = 4096
+    """MoK compute/communication overlap granularity. Must be divisible by 256."""
+
+    moe_megakernel_macrobatch_size: int = 131072
+    """MoK token ring-buffer size. Must be a positive multiple of the minibatch size."""
+
+    moe_megakernel_schedule_capacity_multiplier: float = 0.5
+    """Worst-case fraction of routes expected to land on a single EP rank. Overflow is a
+    device-side trap, not a recoverable error, so keep a conservative margin."""
+
+    moe_megakernel_recompute_forward_context: bool = False
+    """Discard MoK's saved forward context and rebuild it before backward, trading time for
+    activation memory."""
+
     """Enable overlapping between shared expert computations and dispatcher communications.
     Without this, the shared experts execute before the router. 
     Only effective when moe-shared-expert-intermediate-size is set.

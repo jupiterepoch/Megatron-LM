@@ -351,6 +351,33 @@ class MoELayer(BaseMoELayer):
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
+        # Optional fused MoE megakernel backend for the routed experts.
+        self.mok_backend_config = None
+        if getattr(self.config, "moe_megakernel_backend", None) is not None:
+            if self.config.moe_megakernel_backend != "mok":
+                raise ValueError(
+                    "moe_megakernel_backend must be None or 'mok', got "
+                    f"{self.config.moe_megakernel_backend!r}"
+                )
+            from megatron.core.transformer.moe import mok_backend
+
+            mok_backend.check_compatibility(
+                self.config, utils.get_pg_size(self.ep_group), num_local_tokens=512
+            )
+            self.mok_backend_config = mok_backend.MoKBackendConfig(
+                fwd_num_comm_sms=self.config.moe_megakernel_fwd_num_comm_sms,
+                bwd_num_comm_sms=self.config.moe_megakernel_bwd_num_comm_sms,
+                minibatch_size=self.config.moe_megakernel_minibatch_size,
+                macrobatch_size=self.config.moe_megakernel_macrobatch_size,
+                schedule_capacity_multiplier=(
+                    self.config.moe_megakernel_schedule_capacity_multiplier
+                ),
+                use_mxfp8=bool(getattr(self.config, "fp8", None)),
+                recompute_forward_context=(
+                    self.config.moe_megakernel_recompute_forward_context
+                ),
+            )
+
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":
             if config.inference_grouped_gemm_backend == 'auto':
@@ -579,6 +606,41 @@ class MoELayer(BaseMoELayer):
         output = self.token_dispatcher.token_combine(output)
         return output
 
+    def mok_routed_compute(
+        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
+    ):
+        """Runs the routed experts through the MoK megakernel.
+
+        Replaces preprocess -> dispatch -> routed_experts_compute -> combine with a single
+        fused kernel.  The router, its probabilities, and the auxiliary-loss autograd
+        attachment are untouched: MoK's router-weight gradient flows back through `gather`
+        into the dense `probs` tensor.  The shared expert is handled by the caller.
+        """
+        from megatron.core.transformer.moe import mok_backend
+
+        experts = self.experts
+        num_local_experts = self.num_local_experts
+        for linear, label in ((experts.linear_fc1, "linear_fc1"), (experts.linear_fc2, "linear_fc2")):
+            if getattr(linear, "weight0", None) is None:
+                raise ValueError(
+                    f"moe_megakernel_backend='mok' needs per-expert {label}.weight<i> "
+                    "parameters; disable moe_single_grouped_weight."
+                )
+        fc1_weights = [getattr(experts.linear_fc1, f"weight{i}") for i in range(num_local_experts)]
+        fc2_weights = [getattr(experts.linear_fc2, f"weight{i}") for i in range(num_local_experts)]
+
+        return mok_backend.mok_routed_experts_forward(
+            hidden_states,
+            probs,
+            routing_map,
+            fc1_weights=fc1_weights,
+            fc2_weights=fc2_weights,
+            intermediate_size=self.config.moe_ffn_hidden_size,
+            topk=self.config.moe_router_topk,
+            ep_group=self.ep_group,
+            backend_config=self.mok_backend_config,
+        )
+
     def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
         """Project the output back from latent dimension to hidden dimension after combine
         in latent dimension if needed. Combine expert output with shared_experts if needed.
@@ -656,6 +718,15 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
+            if self.mok_backend_config is not None:
+                # Fused routed-expert megakernel; Megatron keeps its own (optionally gated)
+                # shared expert in the ordinary PyTorch graph and adds it here.
+                shared_expert_output = self.shared_experts_compute(hidden_states)
+                probs, routing_map = self.route(hidden_states, padding_mask)
+                output = self.mok_routed_compute(hidden_states, probs, routing_map)
+                if shared_expert_output is not None:
+                    output = output + shared_expert_output
+                return output, None
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
